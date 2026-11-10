@@ -1,0 +1,24 @@
+# Entornos virtuales
+vision/
+visionScriptsactivate/
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Modelos descargados y exportados por Ultralytics
+*.pt
+*_ncnn_model/
+
+# Datos y modelos que genera cada estudiante con 08.1 y 08.2
+datos/
+modelos/
+
+# Resultados generados por los scripts
+resultados/
+
+# Certificado autofirmado que genera 07_yolo_esp32.py (la clave privada no se versiona)
+cert.pem
+key.pem

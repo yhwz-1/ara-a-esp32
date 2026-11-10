@@ -1,0 +1,28 @@
+# Práctica: procesamiento de imágenes, OCR y YOLO — Tecnologías Disruptivas (UNAB)
+# Requiere Python 3.10 o superior. Con el entorno virtual activado:
+#   pip install -r requirements.txt
+
+# Instalación base (README, sección 1). Ultralytics ya instala OpenCV y NumPy.
+ultralytics
+pytesseract
+requests
+
+# Extensión: YOLO como API con FastAPI (yolo_api.py)
+fastapi
+uvicorn
+python-multipart
+
+# 07_yolo_esp32.py: cámara del teléfono por el navegador (qrcode es opcional)
+aiohttp
+cryptography
+qrcode
+
+# 08.1, 08.2 y 08.3: entrenar un clasificador de gestos (versiones probadas con Python 3.13).
+# Modelo y escalador dependen de estas versiones: si las cambias, vuelve a entrenar.
+mediapipe==1.2.0
+tensorflow==2.21.0
+scikit-learn==1.9.1
+pandas==3.1.0
+joblib==1.6.0
+
+# Tesseract (para el OCR) NO se instala con pip; ver README, sección 1.
