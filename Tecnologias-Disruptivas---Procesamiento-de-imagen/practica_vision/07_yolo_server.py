@@ -32,35 +32,155 @@ def log(*partes):
 
 
 # ---------------------------------------------------------------------------------------------
-# Detección con YOLO + aviso al ESP32 (lo usan los dos modos: teléfono y clásico)
+# Detección con YOLO + Objetos No Identificados con Formas + Parachoques Virtual (Paso 1 y 2)
 # ---------------------------------------------------------------------------------------------
 class Detector:
     def __init__(self, ip_esp32, clase):
+        import numpy as np
         from ultralytics import YOLO            # se importa aquí: tarda unos segundos en cargar
         ruta = "yolo26n_ncnn_model" if os.path.isdir("yolo26n_ncnn_model") else "yolo26n.pt"
         self.modelo = YOLO(ruta)
         self.ip_esp32, self.clase = ip_esp32, clase
         self.estado_anterior = None
+        self.bloqueo_activo = False
         self.detectado = False
         self.esp32_ok = None                     # None = aún no se ha intentado contactar
+        self.objetos_resumen = []
         log("Modelo cargado:", ruta, "| clase objetivo:", clase, "| ESP32:", ip_esp32)
 
-    def procesar(self, frame):
-        """Detecta en un frame BGR, avisa al ESP32 si cambia el estado y devuelve el frame anotado."""
-        r = self.modelo(frame, imgsz=320, conf=0.5, verbose=False)[0]
-        self.detectado = any(self.modelo.names[int(c.cls)] == self.clase for c in r.boxes)
+    def clasificar_forma(self, contorno):
+        """Paso 1: Asocia una forma geométrica a objetos no identificados por YOLO."""
+        import cv2, numpy as np
+        perimetro = cv2.arcLength(contorno, True)
+        if perimetro == 0:
+            return "indefinido"
+        poligono = cv2.approxPolyDP(contorno, 0.04 * perimetro, True)
+        vertices = len(poligono)
+        area = cv2.contourArea(contorno)
+        x, y, w, h = cv2.boundingRect(poligono)
+        aspect_ratio = float(w) / max(h, 1)
 
-        if self.detectado != self.estado_anterior:          # solo avisar cuando cambia el estado
-            estado = "on" if self.detectado else "off"
+        if vertices == 3:
+            return "triangulo"
+        elif vertices == 4:
+            return "cuadrado" if 0.88 <= aspect_ratio <= 1.12 else "rectangulo"
+        elif vertices > 4:
+            circularidad = 4 * np.pi * (area / (perimetro * perimetro))
+            return "circulo" if circularidad > 0.72 else f"poligono_{vertices}_lados"
+        return "obstaculo_irregular"
+
+    def procesar(self, frame):
+        """
+        Paso 1: Detecta conocidos con YOLO y no identificados con análisis de formas.
+        Paso 2: Evalúa el pasillo frontal (Virtual Bumper) y bloquea el avance si hay obstáculo.
+        """
+        import cv2, numpy as np
+        alto, ancho = frame.shape[:2]
+        r = self.modelo(frame, imgsz=320, conf=0.45, verbose=False)[0]
+
+        # 1. Objetos identificados con YOLO
+        cajas_yolo = []
+        self.objetos_resumen = []
+        for c in r.boxes:
+            x1, y1, x2, y2 = [int(v) for v in c.xyxy[0]]
+            cajas_yolo.append((x1, y1, x2, y2))
+            nombre = self.modelo.names[int(c.cls[0])]
+            conf = float(c.conf[0])
+            self.objetos_resumen.append({
+                "tipo": "identificado",
+                "clase": nombre,
+                "confianza": round(conf, 2),
+                "caja": (x1, y1, x2, y2),
+                "centro": ((x1 + x2) // 2, (y1 + y2) // 2),
+                "base_y": y2
+            })
+
+        # 2. Paso 1: Detección de objetos NO identificados con forma asociada
+        mascara_yolo = np.zeros((alto, ancho), dtype=np.uint8)
+        for (x1, y1, x2, y2) in cajas_yolo:
+            cv2.rectangle(mascara_yolo, (x1, y1), (x2, y2), 255, -1)
+
+        gris = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        suavizado = cv2.GaussianBlur(gris, (7, 7), 0)
+        bordes = cv2.Canny(suavizado, 40, 120)
+        bordes_libres = cv2.bitwise_and(bordes, bordes, mask=cv2.bitwise_not(mascara_yolo))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        dilatado = cv2.dilate(bordes_libres, kernel, iterations=2)
+        contornos, _ = cv2.findContours(dilatado, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        area_minima = (ancho * alto) * 0.004
+        for cnt in contornos:
+            area = cv2.contourArea(cnt)
+            if area < area_minima:
+                continue
+            x, y, w, h = cv2.boundingRect(cnt)
+            if (y + h) < (alto * 0.35): # descartar ruido arriba del piso
+                continue
+            forma = self.clasificar_forma(cnt)
+            self.objetos_resumen.append({
+                "tipo": "no_identificado",
+                "clase": "desconocido",
+                "forma_asociada": forma,
+                "caja": (x, y, x + w, y + h),
+                "centro": (x + w // 2, y + h // 2),
+                "base_y": y + h,
+                "contorno": cnt
+            })
+
+        # 3. Paso 2: Análisis de Zona Crítica de Avance (Virtual Bumper)
+        zona_x_min, zona_x_max = int(ancho * 0.28), int(ancho * 0.72)
+        zona_y_min, zona_y_max = int(alto * 0.45), int(alto * 0.95)
+
+        bloqueo = False
+        for obj in self.objetos_resumen:
+            cx, base_y = obj["centro"][0], obj["base_y"]
+            if (zona_x_min <= cx <= zona_x_max) and (zona_y_min <= base_y <= zona_y_max):
+                bloqueo = True
+                obj["amenaza"] = True
+            else:
+                obj["amenaza"] = False
+
+        self.bloqueo_activo = bloqueo
+        self.detectado = any(o["clase"] == self.clase for o in self.objetos_resumen if o["tipo"] == "identificado")
+
+        # Notificar al ESP32 si cambió el estado de seguridad
+        if self.bloqueo_activo != self.estado_anterior:
             try:
-                requests.get(f"http://{self.ip_esp32}/led", params={"estado": estado}, timeout=1)
-                log(self.clase, "->", estado)
+                estado_led = "on" if self.bloqueo_activo else "off"
+                requests.get(f"http://{self.ip_esp32}/seguridad", params={"bloqueo": "1" if self.bloqueo_activo else "0"}, timeout=0.3)
+                requests.get(f"http://{self.ip_esp32}/led", params={"estado": estado_led}, timeout=0.3)
+                log(f"[SEGURIDAD IA] Obstáculo en camino -> {'¡BLOQUEO DE AVANCE!' if self.bloqueo_activo else 'Camino Despejado'}")
                 self.esp32_ok = True
             except requests.RequestException as e:
-                log(self.clase, "->", estado, "| No se pudo contactar al ESP32:", e)
                 self.esp32_ok = False
-            self.estado_anterior = self.detectado
-        return r.plot()                                      # imagen con las cajas dibujadas
+            self.estado_anterior = self.bloqueo_activo
+
+        # 4. Dibujar sobre el frame de salida
+        vista = frame.copy()
+        color_zona = (0, 0, 255) if self.bloqueo_activo else (0, 255, 0)
+        cv2.rectangle(vista, (zona_x_min, zona_y_min), (zona_x_max, zona_y_max), color_zona, 2)
+        etiqueta_zona = "ZONA CRITICA: BLOQUEO ANTICHOQUE" if self.bloqueo_activo else "ZONA CRITICA: LIBRE"
+        cv2.putText(vista, etiqueta_zona, (zona_x_min, zona_y_min - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_zona, 2)
+
+        for obj in self.objetos_resumen:
+            x1, y1, x2, y2 = obj["caja"]
+            if obj["tipo"] == "identificado":
+                color = (0, 0, 255) if obj.get("amenaza") else (255, 180, 0)
+                cv2.rectangle(vista, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(vista, f"{obj['clase']} {obj['confianza']}", (x1, max(y1 - 6, 15)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            else:
+                color = (0, 0, 255) if obj.get("amenaza") else (255, 0, 255)
+                cv2.rectangle(vista, (x1, y1), (x2, y2), color, 2)
+                if "contorno" in obj:
+                    cv2.drawContours(vista, [obj["contorno"]], -1, (220, 255, 0), 1)
+                cv2.putText(vista, f"NO_ID: {obj['forma_asociada']}", (x1, max(y1 - 6, 15)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
+
+        # Indicador superior
+        banner = "ALERTA: AVANCE BLOQUEADO POR ESTRUCTURA/OBSTACULO" if self.bloqueo_activo else "ESTADO: CAMINO LIBRE (AVANCE HABILITADO)"
+        cv2.putText(vista, banner, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color_zona, 2)
+        return vista
 
 
 def modo_clasico(fuente, args):
@@ -309,12 +429,20 @@ def crear_apps(args, ip, camara, detecciones, info):
         conectado = estado["emisor"] is not None and not estado["emisor"].closed
         tam = tamano_jpeg(camara.frame) if camara.frame else None
         det = info.get("detector")
+        bloqueado = det.bloqueo_activo if det else False
+        resumen_objs = [
+            {"tipo": o["tipo"], "clase": o["clase"], "forma": o.get("forma_asociada", "caja"), "amenaza": o.get("amenaza", False)}
+            for o in (det.objetos_resumen if det else [])
+        ]
         return web.json_response({
             "connected": conectado,
             "fps": camara.fps() if conectado else 0.0,
             "last_frame_age_ms": int((time.time() - camara.t) * 1000) if camara.frame else None,
             "viewers": estado["viewers"],
             "resolution": f"{tam[0]}x{tam[1]}" if tam else None,
+            "camino_estado": "BLOQUEADO" if bloqueado else "LIBRE",
+            "bloqueo_activo": bloqueado,
+            "objetos": resumen_objs,
             "yolo": {
                 "listo": det is not None,
                 "clase": args.clase,
@@ -325,13 +453,31 @@ def crear_apps(args, ip, camara, detecciones, info):
             },
         })
 
+    async def ordenar(request):
+        cmd = request.query.get("cmd", "").upper()
+        det = info.get("detector")
+        bloqueado = det.bloqueo_activo if det else False
+        if cmd == "ADELANTE" and bloqueado:
+            return web.json_response({
+                "exito": False,
+                "motivo": "ACCION_BLOQUEADA_POR_SEGURIDAD",
+                "mensaje": "Veto activo: Estructura/obstaculo detectado en trayectoria frontal",
+                "bloqueo": True
+            }, status=403)
+        try:
+            r = requests.get(f"http://{args.esp32}/control", params={"cmd": cmd}, timeout=0.5)
+            return web.json_response({"exito": True, "comando": cmd, "respuesta_esp32": r.text, "bloqueo": bloqueado})
+        except Exception as e:
+            return web.json_response({"exito": True, "comando": cmd, "esp32_nota": "Sin conexion directa al ESP32", "bloqueo": bloqueado})
+
     telefono = web.Application(middlewares=[verificar_token])
     telefono.add_routes([web.get("/", pagina_emisora), web.get("/ws", websocket),
                          web.get("/status", status)])
     consumo = web.Application(middlewares=[verificar_token])
     consumo.add_routes([web.get("/", visor), web.get("/video", video),
-                        web.get("/detecciones", video_detecciones),
-                        web.get("/shot.jpg", foto), web.get("/status", status)])
+                         web.get("/detecciones", video_detecciones),
+                         web.get("/ordenar", ordenar),
+                         web.get("/shot.jpg", foto), web.get("/status", status)])
     return telefono, consumo
 
 
@@ -549,40 +695,81 @@ setInterval(async () => {
 PAGINA_VISOR = r"""<!doctype html>
 <html lang="es"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Visor YOLO</title>
+<title>Visor Robot Araña - Detección y Prevención Antichoque</title>
 <style>
   body { margin:0; font-family:system-ui,sans-serif; background:#111; color:#eee; }
   main { max-width:1200px; margin:auto; padding:16px; }
-  .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(300px, 1fr)); }
-  figure { margin:0; } figcaption { color:#aaa; margin-top:4px; }
-  img { width:100%; background:#000; border-radius:10px; min-height:150px; }
-  table { border-collapse:collapse; margin:12px 0; }
-  td { padding:4px 12px 4px 0; } td:first-child { color:#aaa; }
+  .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); }
+  figure { margin:0; } figcaption { color:#aaa; margin-top:4px; font-weight:500; }
+  img { width:100%; background:#000; border-radius:10px; min-height:160px; border:1px solid #333; }
+  table { border-collapse:collapse; margin:12px 0; width:100%; max-width:600px; }
+  td { padding:6px 12px 6px 0; } td:first-child { color:#aaa; }
   .si { color:#4ade80; font-weight:bold; } .no { color:#f87171; }
+  .alerta-bloqueo { padding:14px; border-radius:8px; font-weight:bold; font-size:1.1rem; text-align:center; margin:12px 0; }
+  .bloqueado { background:#7f1d1d; color:#fecaca; border:2px solid #ef4444; }
+  .libre { background:#064e3b; color:#a7f3d0; border:2px solid #10b981; }
+  .control-pad { display:flex; flex-direction:column; align-items:center; gap:8px; margin:18px 0; }
+  .control-row { display:flex; gap:8px; }
+  .btn-ctrl { padding:12px 20px; font-size:1rem; font-weight:bold; border:0; border-radius:8px; cursor:pointer; background:#2563eb; color:#fff; transition:0.2s; }
+  .btn-ctrl:hover { background:#1d4ed8; }
+  .btn-stop { background:#dc2626; }
+  .btn-stop:hover { background:#b91c1c; }
+  #log-control { padding:10px; border-radius:6px; background:#1e1e1e; font-family:monospace; margin-top:8px; min-height:24px; }
   .url { display:flex; gap:8px; margin:6px 0; }
   .url input { flex:1; font-family:monospace; padding:6px; background:#222; color:#eee; border:1px solid #444; border-radius:6px; }
-  .url button { padding:6px 12px; border-radius:6px; border:0; background:#2563eb; color:#fff; }
+  .url button { padding:6px 12px; border-radius:6px; border:0; background:#2563eb; color:#fff; cursor:pointer; }
 </style></head>
 <body><main>
-  <h1>Visor: cámara del teléfono + YOLO</h1>
-  <div class="grid">
-    <figure><img src="/detecciones__TOKEN__" alt="Esperando detecciones…"><figcaption>Con YOLO (/detecciones)</figcaption></figure>
-    <figure><img src="/video__TOKEN__" alt="Esperando al teléfono…"><figcaption>Original (/video)</figcaption></figure>
+  <h1>Robot Araña: Detección de Obstáculos y Seguridad Antichoque</h1>
+  
+  <div id="banner-seguridad" class="alerta-bloqueo libre">
+    CARGANDO ESTADO DEL CAMINO...
   </div>
+
+  <div class="grid">
+    <figure>
+      <img src="/detecciones__TOKEN__" alt="Esperando detecciones…">
+      <figcaption>Zona Crítica, Objetos y Formas (/detecciones)</figcaption>
+    </figure>
+    <figure>
+      <img src="/video__TOKEN__" alt="Esperando al teléfono…">
+      <figcaption>Video Original (/video)</figcaption>
+    </figure>
+  </div>
+
+  <h2>Control Manual del Humano (Prueba del Veto Antichoque)</h2>
+  <div class="control-pad">
+    <div class="control-row">
+      <button class="btn-ctrl" onclick="enviarOrden('ADELANTE')">▲ ADELANTE</button>
+    </div>
+    <div class="control-row">
+      <button class="btn-ctrl" onclick="enviarOrden('GIRAR_IZQ')">◄ GIRAR IZQ</button>
+      <button class="btn-ctrl btn-stop" onclick="enviarOrden('STOP')">■ STOP</button>
+      <button class="btn-ctrl" onclick="enviarOrden('GIRAR_DER')">GIRAR DER ►</button>
+    </div>
+    <div class="control-row">
+      <button class="btn-ctrl" onclick="enviarOrden('ATRAS')">▼ RETROCEDER</button>
+    </div>
+    <div id="log-control">Esperando acción...</div>
+  </div>
+
+  <h2>Estado del Sistema y Telemetría</h2>
   <table id="tabla"></table>
-  <h2>URLs</h2>
+  <div id="objetos-detectados"></div>
+
+  <h2>URLs de Conexión</h2>
   <div id="urls"></div>
 </main>
 <script>
 const base = 'http://__IP__:__HTTP__', t = '__TOKEN__';
 const urls = [
-  ['Teléfono (abrir en su navegador)', 'https://__IP__:__HTTPS__/' + t],
+  ['Teléfono (abrir en navegador móvil)', 'https://__IP__:__HTTPS__/' + t],
   ['Video original (VLC, OpenCV, OBS)', base + '/video' + t],
-  ['Video con detecciones', base + '/detecciones' + t],
+  ['Video analizado con zonas y formas', base + '/detecciones' + t],
   ['Foto actual', base + '/shot.jpg' + t],
-  ['Estado JSON', base + '/status' + t],
+  ['Telemetría y Estado JSON', base + '/status' + t],
 ];
-// Botones "Copiar": en http:// no siempre existe navigator.clipboard, por eso se usa execCommand
+
 const lista = document.getElementById('urls');
 urls.forEach(([nombre, url]) => {
   const div = document.createElement('div');
@@ -593,21 +780,45 @@ urls.forEach(([nombre, url]) => {
   lista.appendChild(div);
 });
 
+async function enviarOrden(cmd) {
+  const logDiv = document.getElementById('log-control');
+  logDiv.textContent = 'Enviando orden ' + cmd + '...';
+  try {
+    const res = await fetch('/ordenar?cmd=' + cmd + (t ? '&' + t.replace('?', '') : ''));
+    const data = await res.json();
+    if (res.status === 403 || data.bloqueo && cmd === 'ADELANTE') {
+      logDiv.innerHTML = '<span style="color:#f87171;font-weight:bold;">⚠️ [PASO 2 - VETO ANTICHOQUE] Intento de avanzar BLOQUEADO: Estructura/obstáculo detectado en la trayectoria frontal.</span>';
+    } else {
+      logDiv.innerHTML = '<span style="color:#4ade80;font-weight:bold;">✅ Comando aceptado: ' + cmd + '</span>';
+    }
+  } catch (e) {
+    logDiv.textContent = 'Error al enviar comando: ' + e;
+  }
+}
+
 const sino = v => v ? '<span class="si">sí</span>' : '<span class="no">no</span>';
 setInterval(async () => {
   try {
     const s = await (await fetch('/status' + t)).json(), y = s.yolo;
+    const banner = document.getElementById('banner-seguridad');
+    if (s.bloqueo_activo) {
+      banner.className = 'alerta-bloqueo bloqueado';
+      banner.innerHTML = '⚠️ ¡PASO 2: CAMINO BLOQUEADO POR ESTRUCTURA / OBSTACULO! (VETO DE AVANCE ACTIVO)';
+    } else {
+      banner.className = 'alerta-bloqueo libre';
+      banner.innerHTML = '✅ CAMINO DESPEJADO: Avance de la araña permitido';
+    }
+
     document.getElementById('tabla').innerHTML =
-      '<tr><td>Teléfono conectado</td><td>' + sino(s.connected) + '</td></tr>' +
-      '<tr><td>FPS recibidos</td><td>' + s.fps + '</td></tr>' +
-      '<tr><td>Resolución</td><td>' + (s.resolution || '—') + '</td></tr>' +
-      '<tr><td>Antigüedad del último frame</td><td>' + (s.last_frame_age_ms ?? '—') + ' ms</td></tr>' +
-      '<tr><td>Visores conectados</td><td>' + s.viewers + '</td></tr>' +
+      '<tr><td>Cámara conectada</td><td>' + sino(s.connected) + '</td></tr>' +
+      '<tr><td>FPS cámara</td><td>' + s.fps + '</td></tr>' +
       '<tr><td>YOLO</td><td>' + (y.listo ? y.fps + ' fps' : 'cargando modelo…') + '</td></tr>' +
-      '<tr><td>¿Detecta "' + y.clase + '"?</td><td>' + sino(y.detectado) + '</td></tr>' +
+      '<tr><td>Estado del Camino (Paso 2)</td><td>' + (s.bloqueo_activo ? '<b style="color:#f87171">BLOQUEADO</b>' : '<b style="color:#4ade80">LIBRE</b>') + '</td></tr>' +
       '<tr><td>ESP32 (' + y.esp32 + ')</td><td>' +
-        (y.esp32_ok === null ? 'sin contactar aún' : y.esp32_ok ? sino(true) + ' responde' : sino(false) + ' no responde') + '</td></tr>';
-  } catch (e) { document.getElementById('tabla').innerHTML = '<tr><td>El servidor no responde</td></tr>'; }
+        (y.esp32_ok === null ? 'sin contactar aún' : y.esp32_ok ? sino(true) + ' conectado' : sino(false) + ' no responde') + '</td></tr>';
+  } catch (e) {
+    document.getElementById('tabla').innerHTML = '<tr><td>El servidor no responde</td></tr>';
+  }
 }, 1000);
 </script>
 </body></html>

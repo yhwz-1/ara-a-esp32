@@ -1,0 +1,143 @@
+================================================================================
+INSTRUCTIVO DE USO: SISTEMA DE DETECCIÓN DE CAMINO, OBSTÁCULOS Y SEGURIDAD ANTICHOQUE
+PROYECTO: ROBOT ARAÑA ESP32 + INTELIGENCIA ARTIFICIAL (YOLO + OPENCV)
+================================================================================
+
+Este documento explica de forma clara y paso a paso cómo funciona y cómo utilizar
+el sistema de visión, análisis de camino y prevención activa de choques.
+
+--------------------------------------------------------------------------------
+1. RESUMEN DE LOS DOS PASOS OBLIGATORIOS IMPLEMENTADOS
+--------------------------------------------------------------------------------
+
+[PASO 1] DETECCIÓN Y ENVÍO DE TELEMETRÍA AMBIENTAL:
+  • Objetos Conocidos: Detectados por el modelo YOLO (personas, sillas, botellas,
+    cajas, etc.) extrayendo su clase, porcentaje de confianza y caja delimitadora.
+  • Objetos NO Identificados: Cualquier masa, obstáculo o perturbación en el suelo
+    que YOLO no reconozca es detectado mediante segmentación y análisis de contornos
+    con OpenCV. A cada uno se le asocia una FORMA GEOMÉTRICA:
+      - Cuadrado o Rectángulo (cajas, libros, paredes, escalones).
+      - Círculo (cilindros, pelotas, patas de mesas o tubos).
+      - Triángulo (rampas o esquinas agudas).
+      - Polígono Irregular (objetos complejos o deformes).
+  • Envío de Datos: Todos los objetos se empaquetan en un JSON estructurado y se
+    envían por red (HTTP/WebSocket) al ESP32 y a la interfaz web.
+
+[PASO 2] ANÁLISIS DE CAMINO Y VETO ACTIVO DE COLISIÓN (VIRTUAL BUMPER):
+  • La IA proyecta una "Zona Crítica de Avance" (un pasillo frontal inferior en la
+    cámara que representa el espacio físico donde pisará la araña en sus próximos pasos).
+  • Si algún obstáculo o estructura (identificado o desconocido) entra a ese pasillo:
+      -> La zona se pone en ROJO.
+      -> Se activa el estado: BLOQUEO_AVANCE = TRUE.
+  • REGLA INQUEBRANTABLE DE SEGURIDAD (Override Antichoque):
+    A PESAR DE QUE EL HUMANO SIGA PRESIONANDO "ADELANTE" (con joystick, app web
+    o teclado), la araña BLOQUEA FÍSICAMENTE EL AVANCE para evitar estrellarse.
+  • El robot SÍ permite maniobras de escape: retroceder ("ATRAS") o girar
+    ("GIRAR_IZQ" / "GIRAR_DER") para buscar una salida despejada.
+
+--------------------------------------------------------------------------------
+2. ARCHIVOS MODIFICADOS Y CREADOS EN EL PROYECTO
+--------------------------------------------------------------------------------
+
+A. Lado Visión e Inteligencia Artificial (PC / Raspberry Pi):
+   1. 07_yolo_server.py: Servidor web con stream de video, detector híbrido
+      (YOLO + Formas geométricas OpenCV) y panel interactivo de control.
+   2. vision_arana_obstaculos.py: Script directo de visión por OpenCV/YOLO con
+      telemetría en vivo, visualización de zona crítica y conexión al ESP32.
+   3. CodigoAraña.md: Archivo maestro de instrucciones y orientación para la IA.
+
+B. Lado Microcontrolador (ESP32):
+   1. AranaCode/main.ino: Firmware principal para la araña con servidor web y
+      recepción por comandos serie.
+   2. AranaCode/control.h: Árbitro de seguridad que intercepta y anula las órdenes
+      humanas de avanzar hacia un obstáculo.
+   3. AranaCode/caminar.h: Cinemática de marcha de las patas.
+   4. AranaCode/estabilizador.h: Posturas y alerta visual de colisión (LED pin 2).
+   5. esp32_actuador/esp32_actuador.ino: Versión simplificada para pruebas en placa
+      DevKit suelta en el laboratorio.
+
+--------------------------------------------------------------------------------
+3. GUÍA PASO A PASO PARA UTILIZAR EL SISTEMA
+--------------------------------------------------------------------------------
+
+PASO 3.1: PREPARAR EL ENTORNO PYTHON
+  Abre una terminal en la carpeta practica_vision con el entorno virtual activo:
+    cd c:\Users\Alumno\Desktop\arana\ara-a-esp32\Tecnologias-Disruptivas---Procesamiento-de-imagen\practica_vision
+    python 00_verificar_entorno.py
+
+PASO 3.2: CONFIGURAR Y CARGAR EL ESP32
+  1. Abre Arduino IDE.
+  2. Abre el archivo:
+     c:\Users\Alumno\Desktop\arana\ara-a-esp32\AranaCode\main.ino
+     (o si estás usando solo una placa de prueba: esp32_actuador/esp32_actuador.ino)
+  3. Modifica las credenciales de tu red WiFi:
+     const char* SSID_WIFI = "Tu_Red_WiFi";
+     const char* PASS_WIFI = "Tu_Clave_WiFi";
+  4. Conecta el ESP32 por USB y presiona "Subir" (Upload).
+  5. Abre el Monitor Serie a 115200 baudios y anota la IP asignada (ejemplo: 192.168.1.50).
+
+PASO 3.3: EJECUTAR EL SISTEMA DE VISIÓN CON PREVENCIÓN DE CHOQUES
+
+  OPCIÓN A (Recomendada: Servidor Completo con Visor Web y Control Remoto):
+    python 07_yolo_server.py --esp32 192.168.1.50
+
+    • En la consola aparecerán dos enlaces:
+      - Enlace HTTPS (ej: https://192.168.1.20:8443): Ábrelo en el navegador de tu
+        teléfono para usar su cámara de forma inalámbrica.
+      - Enlace HTTP (ej: http://192.168.1.20:8081): Ábrelo en tu computador. Verás
+        el visor con el video procesado, el estado del camino y los botones de control.
+
+  OPCIÓN B (Visión Directa por Webcam USB):
+    python vision_arana_obstaculos.py --esp32 192.168.1.50
+
+--------------------------------------------------------------------------------
+4. CÓMO VERIFICAR Y COMPROBAR EL PASO 2 EN VIVO (PRUEBA DE SEGURIDAD)
+--------------------------------------------------------------------------------
+
+1. PRUEBA DE CAMINO DESPEJADO:
+   • Coloca la cámara apuntando hacia un suelo o pasillo libre.
+   • Observa que el recuadro inferior ("ZONA CRITICA") está en VERDE y dice "LIBRE".
+   • Presiona el botón "▲ ADELANTE" en la página web o la tecla 'w' en el Monitor Serie.
+   • Verás que el robot acepta y ejecuta el paso hacia adelante ("EJECUTANDO_ADELANTE").
+
+2. PRUEBA DE OBSTÁCULO Y VETO ACTIVO DE AVANCE (EL PASO 2 EN ACCIÓN):
+   • Coloca una caja, una botella, una estructura o tu mano en la zona central baja.
+   • Comprueba el [PASO 1]:
+     - Si es un objeto reconocido por YOLO, saldrá su nombre (ej: "bottle 0.85").
+     - Si es un objeto cualquiera no reconocido, saldrá en color violeta con su forma:
+       "NO_ID: rectangulo", "NO_ID: circulo" o "NO_ID: triangulo".
+   • Comprueba el [PASO 2]:
+     - La zona crítica se tiñe inmediatamente de ROJO y emite:
+       "¡ALERTA: AVANCE BLOQUEADO POR ESTRUCTURA/OBSTACULO!"
+     - El LED del ESP32 se enciende indicando alarma de colisión.
+   • PRUEBA DEL INTENTO HUMANO:
+     - Presiona intencionalmente el botón "▲ ADELANTE" en la web o presiona 'w'.
+     - Resultado en pantalla:
+       "⚠️ [PASO 2 - VETO ANTICHOQUE] Intento de avanzar BLOQUEADO: Estructura/obstáculo
+        detectado en la trayectoria frontal. Colisión impedida."
+     - El robot NO da ningún paso adelante y permanece detenido.
+
+3. PRUEBA DE MANIOBRA EVASIVA:
+   • Mientras el camino sigue bloqueado al frente, presiona "▼ RETROCEDER" o "◄ GIRAR IZQ".
+   • Resultado: El sistema SÍ permite el retroceso y el giro para salir del peligro.
+   • Gira el robot o retira el obstáculo: la zona vuelve a ponerse VERDE y el avance
+     queda automáticamente restaurado.
+
+--------------------------------------------------------------------------------
+5. PERSONALIZACIÓN Y AJUSTES TÉCNICOS
+--------------------------------------------------------------------------------
+
+• Modificar el ancho o profundidad del pasillo crítico:
+  En 07_yolo_server.py o vision_arana_obstaculos.py puedes ajustar los porcentajes:
+    zona_x_min = int(ancho * 0.28)  # Límite izquierdo del pasillo
+    zona_x_max = int(ancho * 0.72)  # Límite derecho del pasillo
+    zona_y_min = int(alto * 0.45)   # Distancia lejana de frenado
+    zona_y_max = int(alto * 0.95)   # Contacto inmediato con las patas
+
+• Sensibilidad de objetos no identificados:
+  Ajusta el filtro de área mínima en la función procesar():
+    area_minima = (ancho * alto) * 0.004   # Disminuir si los obstáculos son pequeños.
+
+================================================================================
+FIN DEL INSTRUCTIVO
+================================================================================
